@@ -7,7 +7,7 @@ from flask import Flask, render_template, request, send_from_directory
 from werkzeug.utils import secure_filename
 from google import genai
 from google.genai.errors import APIError
-import subprocess_wrapper as subprocess # NOU: Folosim wrapper pentru a stabiliza rularea FFmpeg
+import subprocess # REVENIM LA MODULUL PYTHON STANDARD
 import uuid 
 
 
@@ -50,7 +50,6 @@ def allowed_file(filename):
 
 def extract_text_from_file(filepath, extension):
     text = ""
-    print(f"[EXTRACT] Începe extragerea din fișierul de tip: {extension}")
     if extension == 'pdf':
         try:
             reader = pypdf.PdfReader(filepath)
@@ -134,9 +133,9 @@ def generate_tts_audio(text_content, lang='ro'):
                 tts = gTTS(text=segment, lang=lang, slow=False)
                 tts.save(temp_path)
                 
-                # Scrie calea relativă a fișierului în lista FFmpeg
-                # Render/Gunicorn rulează din directorul rădăcină (src)
-                f.write(f"file 'static/{temp_mp3_name}'\n") 
+                # Folosim calea absolută în lista FFmpeg pentru siguranță
+                full_temp_path = os.path.abspath(temp_path)
+                f.write(f"file '{full_temp_path}'\n") 
                 
                 if i < len(segments) - 1:
                     time.sleep(PAUSE_BETWEEN_REQUESTS)
@@ -156,18 +155,16 @@ def generate_tts_audio(text_content, lang='ro'):
         ]
         
         # Rulează comanda FFmpeg
-        # Setăm timeout pentru a nu bloca serverul Render
         subprocess.run(command, check=True, capture_output=True, timeout=60)
         
         return final_filename, True
 
     except subprocess.CalledProcessError as e:
-        error_msg = f"Eroare FFmpeg: FFmpeg nu a putut concatena. Log-uri: {e.stderr.decode()}"
-        print(error_msg)
+        error_msg = f"Eroare FFmpeg la rulare: FFmpeg a returnat eroare. Log-uri: {e.stderr.decode()}"
         return error_msg, False
     except FileNotFoundError:
-        # Aceasta se întâmplă dacă binarul 'ffmpeg' nu este în PATH
-        return "Eroare FATALĂ: FFmpeg nu a fost găsit. Verificați comanda de compilare.", False
+        # Aceasta se întâmplă dacă binarul 'ffmpeg' nu este în PATH (problema majoră de instalare)
+        return "Eroare FATALĂ: FFmpeg nu a fost găsit. Vă rog să verificați comanda de compilare Render.", False
     except subprocess.TimeoutExpired:
         return "Eroare: Operațiunea FFmpeg a expirat (Timeout de 60s). Documentul este prea lung.", False
     except Exception as e:
@@ -187,9 +184,9 @@ def generate_tts_audio(text_content, lang='ro'):
 def upload_file():
     audio_file = None
     error_message = None
-    should_translate = False # Implicit False pentru cererea GET
+    should_translate = False
     
-    # 1. LOGICA CERERII POST (Când utilizatorul apasă butonul)
+    # 1. LOGICA CERERII POST 
     if request.method == 'POST':
         should_translate = request.form.get('translate_checkbox') == 'on'
         tts_language = request.form.get('tts_language', 'ro')
@@ -224,7 +221,7 @@ def upload_file():
                     if not processed_text.strip():
                         error_message = "Documentul este gol sau nu conține text selectabil."
                     else:
-                        if not error_message: # Rulează TTS doar dacă nu există erori Gemini/Cleanup
+                        if not error_message: 
                             result, success = generate_tts_audio(processed_text, tts_language)
                             
                             if success:
@@ -236,7 +233,6 @@ def upload_file():
                     error_message = f"Eroare neașteptată de procesare pe server: {e}"
 
     # 2. LOGICA CERERII GET (Inițializarea paginii sau returnarea rezultatului)
-    # Rezolvă eroarea Jinja2 când se încearcă afișarea paginii la prima accesare
     return render_template('index.html', audio_file=audio_file, error_message=error_message,
                            should_translate=should_translate)
 
