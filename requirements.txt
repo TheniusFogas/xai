@@ -3,4 +3,3 @@ pypdf
 google-genai
 gtts
 gunicorn
-subprocess-wrapper
