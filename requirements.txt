@@ -1,0 +1,6 @@
+flask
+pypdf
+google-genai
+gtts
+pydub
+gunicorn
