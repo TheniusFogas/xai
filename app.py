@@ -7,8 +7,9 @@ from flask import Flask, render_template, request, send_from_directory
 from werkzeug.utils import secure_filename
 from google import genai
 from google.genai.errors import APIError
-from pydub import AudioSegment 
+import subprocess # NOU: Pentru a rula FFmpeg direct (ocolind pydub)
 import uuid 
+
 
 # --- Configurarea Flask ---
 app = Flask(__name__)
@@ -26,12 +27,11 @@ os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(STATIC_FOLDER, exist_ok=True)
 
 # *** SETĂRI GEMINI ***
-# Pe Render, cheia va fi preluată din variabila de mediu "GEMINI_API_KEY"
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY") 
 
 try:
     if not GEMINI_API_KEY:
-        print("[INIT] AVERTISMENT: GEMINI_API_KEY nu este setat în mediul Cloud.")
+        print("[INIT] AVERTISMENT: GEMINI_API_KEY nu este setat.")
     client = genai.Client(api_key=GEMINI_API_KEY)
 except Exception as e:
     print(f"[INIT] Eroare la inițializarea clientului Gemini: {e}")
@@ -43,7 +43,7 @@ MAX_CHARS_PER_SEGMENT_TTS = 4800
 PAUSE_BETWEEN_REQUESTS = 2 
 
 
-# --- Funcții Utilitare (Extract, Cleanup, Gemini - Fără Schimbări) ---
+# --- Funcții Utilitare (Fără Schimbări) ---
 
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
@@ -74,7 +74,7 @@ def simple_text_cleanup(text):
 def process_text_with_gemini(text_content):
     
     if not GEMINI_API_KEY:
-        return "Eroare: Cheia API Gemini nu este setată în mediul de găzduire.", None
+        return "Eroare: Cheia API Gemini nu este setată în mediul Cloud.", None
 
     prompt = f"""
     Ești un expert în procesarea textului. Traduce textul următor în Română. Foarte Important: Înlătură simbolurile, formatele markdown, spațiile excesive și orice caracter non-text. Nu scurta, păstrează textul integral. Returnează DOAR textul final procesat.
@@ -110,8 +110,8 @@ def process_text_with_gemini(text_content):
     return f"Eroare Gemini: Modelul a rămas supraîncărcat după {MAX_RETRIES} încercări.", None
 
 
-def generate_tts_audio(text_content, lang='ro', output_filename='audio_output.mp3'):
-    """Generează fișierul MP3 vocal folosind gTTS (online) cu fragmentare și lipire (FFmpeg)."""
+def generate_tts_audio(text_content, lang='ro'):
+    """Generează fișierul MP3 vocal folosind gTTS cu FFmpeg direct via subprocess."""
 
     if not text_content.strip():
         return "Textul de sinteză este gol.", False
@@ -119,40 +119,62 @@ def generate_tts_audio(text_content, lang='ro', output_filename='audio_output.mp
     segments = [text_content[i:i + MAX_CHARS_PER_SEGMENT_TTS] 
                 for i in range(0, len(text_content), MAX_CHARS_PER_SEGMENT_TTS)]
     
-    combined_audio = AudioSegment.empty()
     temp_files = []
     
     try:
-        for i, segment in enumerate(segments):
-            temp_mp3_name = f"temp_segment_{uuid.uuid4().hex}.mp3"
-            temp_path = os.path.join(app.config['STATIC_FOLDER'], temp_mp3_name)
-            temp_files.append(temp_path)
-            
-            tts = gTTS(text=segment, lang=lang, slow=False)
-            tts.save(temp_path)
-            
-            # Combinare (necesită FFmpeg care este implicit pe Render)
-            combined_audio += AudioSegment.from_mp3(temp_path)
-            
-            if i < len(segments) - 1:
-                time.sleep(PAUSE_BETWEEN_REQUESTS)
+        # 1. Generează fișiere MP3 temporare și creează un fișier de listă
+        list_file_path = os.path.join(app.config['STATIC_FOLDER'], f"list_{uuid.uuid4().hex}.txt")
+        
+        with open(list_file_path, 'w') as f:
+            for i, segment in enumerate(segments):
+                temp_mp3_name = f"temp_segment_{uuid.uuid4().hex}.mp3"
+                temp_path = os.path.join(app.config['STATIC_FOLDER'], temp_mp3_name)
+                temp_files.append(temp_path)
+                
+                tts = gTTS(text=segment, lang=lang, slow=False)
+                tts.save(temp_path)
+                
+                # Scrie calea relativă a fișierului în lista FFmpeg
+                f.write(f"file '{temp_mp3_name}'\n")
+                
+                if i < len(segments) - 1:
+                    time.sleep(PAUSE_BETWEEN_REQUESTS)
 
-        # Salvarea fișierului final
-        output_path = os.path.join(app.config['STATIC_FOLDER'], output_filename)
-        # Nume fișier unic pentru a evita conflictele de cache
+        # 2. Concatenează fișierele cu FFmpeg
         final_filename = f"tts_{uuid.uuid4().hex}.mp3"
         final_output_path = os.path.join(app.config['STATIC_FOLDER'], final_filename)
-        combined_audio.export(final_output_path, format="mp3")
+        
+        # Comanda FFmpeg pentru concatenare (folosește 'concat' demuxer)
+        command = [
+            'ffmpeg',
+            '-f', 'concat',
+            '-safe', '0',
+            '-i', list_file_path,
+            '-c', 'copy',
+            final_output_path
+        ]
+        
+        # Rulează comanda FFmpeg
+        subprocess.run(command, check=True, capture_output=True)
         
         return final_filename, True
 
+    except subprocess.CalledProcessError as e:
+        error_msg = f"Eroare FFmpeg: FFmpeg nu a putut concatena. Log-uri: {e.stderr.decode()}"
+        print(error_msg)
+        return error_msg, False
+    except FileNotFoundError:
+        # Aceasta se întâmplă dacă binarul 'ffmpeg' nu este în PATH
+        return "Eroare FATALĂ: FFmpeg nu a fost găsit în mediul Render. Vă rugăm contactați suportul Render.", False
     except Exception as e:
-        # Aici apare eroarea dacă FFmpeg lipsește pe Render.
-        return f"Eroare la generarea vocală (TTS). Eroare FFmpeg: {e}", False
+        return f"Eroare la generarea vocală (gTTS/Concatenare): {e}", False
     finally:
+        # Curățarea fișierelor temporare și a listei
         for f in temp_files:
             if os.path.exists(f):
                 os.remove(f)
+        if os.path.exists(list_file_path):
+             os.remove(list_file_path)
 
 
 # --- Rute Flask (Server) ---
@@ -187,6 +209,7 @@ def upload_file():
                 
             processed_text = ""
                 
+            # 1. LOGICA DE PROCESARE (GEMINI / Curățare locală)
             if should_translate:
                 processed_text, target_lang = process_text_with_gemini(text_content)
                 if target_lang is None:
@@ -200,6 +223,7 @@ def upload_file():
             if not processed_text.strip():
                 error_message = "Documentul este gol sau nu conține text selectabil."
             else:
+                # 2. GENEREAZĂ AUDIO (gTTS cu FFmpeg direct)
                 result, success = generate_tts_audio(processed_text, tts_language)
                 
                 if success:
@@ -219,6 +243,4 @@ def serve_audio(filename):
     return send_from_directory(app.config['STATIC_FOLDER'], filename)
 
 if __name__ == '__main__':
-    # Pe Render, serverul Gunicorn sau uWSGI va rula aplicația, nu această linie.
-    # Dar o păstrăm pentru testare locală.
     app.run(debug=False, threaded=False)
