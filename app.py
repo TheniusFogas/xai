@@ -7,7 +7,7 @@ from flask import Flask, render_template, request, send_from_directory
 from werkzeug.utils import secure_filename
 from google import genai
 from google.genai.errors import APIError
-import subprocess # NOU: Pentru a rula FFmpeg direct (ocolind pydub)
+import subprocess_wrapper as subprocess # NOU: Folosim wrapper pentru a stabiliza rularea FFmpeg
 import uuid 
 
 
@@ -31,7 +31,7 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
 try:
     if not GEMINI_API_KEY:
-        print("[INIT] AVERTISMENT: GEMINI_API_KEY nu este setat.")
+        print("[INIT] AVERTISMENT: GEMINI_API_KEY nu este setat în mediul Cloud.")
     client = genai.Client(api_key=GEMINI_API_KEY)
 except Exception as e:
     print(f"[INIT] Eroare la inițializarea clientului Gemini: {e}")
@@ -135,7 +135,8 @@ def generate_tts_audio(text_content, lang='ro'):
                 tts.save(temp_path)
                 
                 # Scrie calea relativă a fișierului în lista FFmpeg
-                f.write(f"file '{temp_mp3_name}'\n")
+                # Render/Gunicorn rulează din directorul rădăcină (src)
+                f.write(f"file 'static/{temp_mp3_name}'\n") 
                 
                 if i < len(segments) - 1:
                     time.sleep(PAUSE_BETWEEN_REQUESTS)
@@ -155,7 +156,8 @@ def generate_tts_audio(text_content, lang='ro'):
         ]
         
         # Rulează comanda FFmpeg
-        subprocess.run(command, check=True, capture_output=True)
+        # Setăm timeout pentru a nu bloca serverul Render
+        subprocess.run(command, check=True, capture_output=True, timeout=60)
         
         return final_filename, True
 
@@ -165,7 +167,9 @@ def generate_tts_audio(text_content, lang='ro'):
         return error_msg, False
     except FileNotFoundError:
         # Aceasta se întâmplă dacă binarul 'ffmpeg' nu este în PATH
-        return "Eroare FATALĂ: FFmpeg nu a fost găsit în mediul Render. Vă rugăm contactați suportul Render.", False
+        return "Eroare FATALĂ: FFmpeg nu a fost găsit. Verificați comanda de compilare.", False
+    except subprocess.TimeoutExpired:
+        return "Eroare: Operațiunea FFmpeg a expirat (Timeout de 60s). Documentul este prea lung.", False
     except Exception as e:
         return f"Eroare la generarea vocală (gTTS/Concatenare): {e}", False
     finally:
@@ -183,59 +187,59 @@ def generate_tts_audio(text_content, lang='ro'):
 def upload_file():
     audio_file = None
     error_message = None
+    should_translate = False # Implicit False pentru cererea GET
     
-    should_translate = request.form.get('translate_checkbox') == 'on'
-    
+    # 1. LOGICA CERERII POST (Când utilizatorul apasă butonul)
     if request.method == 'POST':
+        should_translate = request.form.get('translate_checkbox') == 'on'
         tts_language = request.form.get('tts_language', 'ro')
         
         if 'document' not in request.files:
             error_message = 'Nu a fost găsit niciun fișier în cerere.'
-            return render_template('index.html', error_message=error_message, should_translate=should_translate)
-        
-        file = request.files['document']
-        if file.filename == '' or not file or not allowed_file(file.filename):
-            error_message = 'Tipul de fișier nu este permis. Vă rugăm să folosiți .pdf sau .txt.'
-            return render_template('index.html', error_message=error_message, should_translate=should_translate)
-
-        filename = secure_filename(file.filename)
-        file_extension = filename.rsplit('.', 1)[1].lower()
-        filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-            
-        try:
-            file.save(filepath)
-            text_content = extract_text_from_file(filepath, file_extension)
-            os.remove(filepath)
-                
-            processed_text = ""
-                
-            # 1. LOGICA DE PROCESARE (GEMINI / Curățare locală)
-            if should_translate:
-                processed_text, target_lang = process_text_with_gemini(text_content)
-                if target_lang is None:
-                    error_message = processed_text 
-                    return render_template('index.html', error_message=error_message, should_translate=should_translate)
-                tts_language = 'ro' 
+        else:
+            file = request.files['document']
+            if file.filename == '' or not file or not allowed_file(file.filename):
+                error_message = 'Tipul de fișier nu este permis.'
             else:
-                processed_text = simple_text_cleanup(text_content)
-                tts_language = request.form.get('tts_language', 'ro') 
-                
-            if not processed_text.strip():
-                error_message = "Documentul este gol sau nu conține text selectabil."
-            else:
-                # 2. GENEREAZĂ AUDIO (gTTS cu FFmpeg direct)
-                result, success = generate_tts_audio(processed_text, tts_language)
-                
-                if success:
-                    audio_file = result
-                else:
-                    error_message = result
+                filename = secure_filename(file.filename)
+                file_extension = filename.rsplit('.', 1)[1].lower()
+                filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+                    
+                try:
+                    file.save(filepath)
+                    text_content = extract_text_from_file(filepath, file_extension)
+                    os.remove(filepath)
                         
-        except Exception as e:
-            error_message = f"Eroare neașteptată de procesare pe server: {e}"
-            
+                    processed_text = ""
+                        
+                    if should_translate:
+                        processed_text, target_lang = process_text_with_gemini(text_content)
+                        if target_lang is None:
+                            error_message = processed_text 
+                        tts_language = 'ro' 
+                    else:
+                        processed_text = simple_text_cleanup(text_content)
+                        tts_language = request.form.get('tts_language', 'ro') 
+                        
+                    if not processed_text.strip():
+                        error_message = "Documentul este gol sau nu conține text selectabil."
+                    else:
+                        if not error_message: # Rulează TTS doar dacă nu există erori Gemini/Cleanup
+                            result, success = generate_tts_audio(processed_text, tts_language)
+                            
+                            if success:
+                                audio_file = result
+                            else:
+                                error_message = result
+                                    
+                except Exception as e:
+                    error_message = f"Eroare neașteptată de procesare pe server: {e}"
+
+    # 2. LOGICA CERERII GET (Inițializarea paginii sau returnarea rezultatului)
+    # Rezolvă eroarea Jinja2 când se încearcă afișarea paginii la prima accesare
     return render_template('index.html', audio_file=audio_file, error_message=error_message,
                            should_translate=should_translate)
+
 
 @app.route('/static/<filename>')
 def serve_audio(filename):
